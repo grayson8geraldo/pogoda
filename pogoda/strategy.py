@@ -106,19 +106,27 @@ def check_weather_stability(
     snapshot: WeatherSnapshot,
     consensus_temp: int,
     threshold: float,
+    temp_unit: str = "C",
 ) -> bool:
-    """Check if weather is stable (today's actual vs tomorrow's forecast are similar)."""
+    """Check if weather is stable (today's actual vs tomorrow's forecast are similar).
+
+    Both values must be in the same unit for comparison. today_actual_max is always in °C,
+    so we convert it to the target unit before comparing.
+    """
     if snapshot.today_actual_max is None:
         return True
-    diff = abs(snapshot.today_actual_max - consensus_temp)
-    stable = diff <= threshold
+    from .utils import convert_temp
+    today_converted = convert_temp(snapshot.today_actual_max, temp_unit) if temp_unit == "F" else snapshot.today_actual_max
+    # Adjust threshold for Fahrenheit (1°C ≈ 1.8°F)
+    adj_threshold = threshold * 1.8 if temp_unit == "F" else threshold
+    diff = abs(today_converted - consensus_temp)
+    stable = diff <= adj_threshold
     if not stable:
         logger.info(
-            "Weather unstable: today=%.1f°C, forecast=%d, diff=%.1f (threshold=%.1f)",
-            snapshot.today_actual_max,
-            consensus_temp,
-            diff,
-            threshold,
+            "Weather unstable: today=%.1f%s, forecast=%d%s, diff=%.1f (threshold=%.1f)",
+            today_converted, "°F" if temp_unit == "F" else "°C",
+            consensus_temp, "°F" if temp_unit == "F" else "°C",
+            diff, adj_threshold,
         )
     return stable
 
@@ -153,9 +161,9 @@ def generate_orders(
 
     logger.info("Bin step detected: %d (unit=%s)", bin_step, market.temp_unit)
 
-    # Check weather stability
+    # Check weather stability (compare in same temperature unit)
     decision.weather_stable = check_weather_stability(
-        snapshot, center, settings.stability_threshold_c
+        snapshot, center, settings.stability_threshold_c, temp_unit=market.temp_unit
     )
     if not decision.weather_stable:
         decision.rejection_reasons.append("Weather unstable (large day-to-day variation)")
@@ -231,12 +239,11 @@ def generate_orders(
     decision.total_cost_cents = sum(o.cost_cents for o in decision.orders)
     decision.total_ev_cents = sum(o.expected_value_cents for o in decision.orders)
 
-    # Best case: center bin wins → payout = 100¢ * shares, minus cost of all orders
-    center_bin_order = next(
-        (o for o in decision.orders if o.temp_value == center), None
-    )
-    if center_bin_order:
-        payout = center_bin_order.potential_payout_cents
+    # Best case: ANY of our core bins wins → payout = 100¢ * shares, minus cost of all orders
+    # Find the core order with highest payout (center bin or closest)
+    core_orders = [o for o in decision.orders if o.order_type == "core"]
+    if core_orders:
+        payout = core_orders[0].potential_payout_cents  # All same size, so any = 100¢ * shares
         profit = payout - decision.total_cost_cents
         decision.best_case_profit_pct = (
             (profit / decision.total_cost_cents * 100)
