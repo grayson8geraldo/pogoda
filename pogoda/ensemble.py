@@ -16,7 +16,7 @@ from .utils import convert_temp
 
 logger = logging.getLogger(__name__)
 
-ENSEMBLE_API = "https://api.open-meteo.com/v1/ensemble"
+ENSEMBLE_API = "https://ensemble-api.open-meteo.com/v1/ensemble"
 TIMEOUT = 20.0
 
 # Available ensemble models and their member counts
@@ -25,6 +25,8 @@ ENSEMBLE_MODELS = {
     "ecmwf_ifs025": 51,
     "icon_seamless": 40,
 }
+# Fallback URL if the primary endpoint fails
+ENSEMBLE_API_FALLBACK = "https://api.open-meteo.com/v1/ensemble"
 
 
 @dataclass
@@ -99,7 +101,10 @@ async def _fetch_ensemble(
     }
 
     try:
+        # Try primary endpoint, fallback to alternative
         resp = await client.get(ENSEMBLE_API, params=params, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            resp = await client.get(ENSEMBLE_API_FALLBACK, params=params, timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
 

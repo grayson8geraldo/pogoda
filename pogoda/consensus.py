@@ -12,7 +12,8 @@ from .weather import WeatherSnapshot, fetch_backup_forecast, fetch_nws_backup, f
 logger = logging.getLogger(__name__)
 
 # Maximum allowed spread (°C) between all models for automatic consensus
-CONSENSUS_SPREAD = 1.0
+# 2.0°C is reasonable — models commonly differ by 1-2°C, and this equals ~3.6°F
+CONSENSUS_SPREAD = 2.0
 
 
 @dataclass

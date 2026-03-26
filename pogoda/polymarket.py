@@ -55,16 +55,42 @@ class WeatherMarket:
         )
 
     def get_bin(self, temp: int) -> TemperatureBin | None:
-        """Find bin matching a specific temperature."""
+        """Find bin matching a specific temperature.
+
+        For 2°F range bins like "60-61°F" (temp_value=60), matches if
+        temp falls within [low, low+step).
+        """
+        step = self._detect_step()
         for b in self.bins:
-            if b.temp_value == temp:
-                return b
+            if b.temp_value is None or b.is_range:
+                continue
+            if step > 1:
+                # Range bin: temp_value is the low end
+                if b.temp_value <= temp < b.temp_value + step:
+                    return b
+            else:
+                if b.temp_value == temp:
+                    return b
         return None
+
+    def _detect_step(self) -> int:
+        """Detect step between bins (1 for °C, 2 for °F)."""
+        sorted_bins = [b for b in self.bins if b.temp_value is not None and not b.is_range]
+        sorted_bins.sort(key=lambda b: b.temp_value)  # type: ignore[arg-type]
+        if len(sorted_bins) >= 2:
+            gaps = [sorted_bins[i+1].temp_value - sorted_bins[i].temp_value  # type: ignore
+                    for i in range(len(sorted_bins) - 1)
+                    if sorted_bins[i+1].temp_value is not None and sorted_bins[i].temp_value is not None]
+            if gaps:
+                from collections import Counter
+                return Counter(gaps).most_common(1)[0][0]
+        return 2 if self.temp_unit == "F" else 1
 
     def get_bins_range(self, center: int, radius: int) -> list[TemperatureBin]:
         """Get bins within ±radius of center temperature."""
+        step = self._detect_step()
         result = []
-        for offset in range(-radius, radius + 1):
+        for offset in range(-radius, radius + 1, step):
             b = self.get_bin(center + offset)
             if b:
                 result.append(b)
@@ -74,16 +100,31 @@ class WeatherMarket:
 def _parse_temp_from_outcome(outcome: str) -> tuple[int | None, bool]:
     """Parse temperature integer from outcome string.
 
-    Handles formats like: "12", "12°C", "12°F", "12 °C", "≥30", "≤-5", ">30", "<-5"
+    Handles formats:
+    - "12", "12°C", "12°F"           → (12, False)
+    - "50-51°F", "50-51"             → (50, False)  [lower bound of 2°F range]
+    - "≥30", "≤-5", ">30", "<-5"    → (30/-5, True)
+    - "49°F or below", "68°F or higher" → (49/68, True)
     """
     outcome = outcome.strip()
+
+    # "X°F or below" / "X°F or higher" range bins
+    or_match = re.match(r"(-?\d+)\s*°?\s*[FC]?\s+or\s+(below|higher|above|lower)", outcome, re.I)
+    if or_match:
+        return int(or_match.group(1)), True
 
     # Range bins (≥, ≤, >, <)
     range_match = re.match(r"[≥≤><]\s*(-?\d+)", outcome)
     if range_match:
         return int(range_match.group(1)), True
 
-    # Regular temperature bins
+    # Two-degree range bins: "50-51°F", "50-51"
+    range_bin = re.match(r"(-?\d+)\s*[-–]\s*(-?\d+)", outcome)
+    if range_bin:
+        low = int(range_bin.group(1))
+        return low, False
+
+    # Regular temperature bins: "12", "12°C", "12 °F"
     temp_match = re.match(r"(-?\d+)", outcome)
     if temp_match:
         return int(temp_match.group(1)), False
@@ -330,6 +371,24 @@ async def get_market_orderbook(token_id: str) -> dict:
         return {"bids": [], "asks": []}
 
 
+async def _fetch_clob_price(client: httpx.AsyncClient, token_id: str) -> float:
+    """Fetch real-time midpoint price from CLOB API for a token."""
+    try:
+        resp = await client.get(
+            f"{CLOB_API}/midpoint",
+            params={"token_id": token_id},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        mid = data.get("mid")
+        if mid is not None:
+            return float(mid) * 100  # Convert 0-1 to cents
+    except Exception:
+        pass
+    return 0.0
+
+
 async def fetch_weather_market(event: dict) -> WeatherMarket | None:
     """Convert a raw Gamma API event into a structured WeatherMarket with priced bins."""
     markets = event.get("markets", [])
@@ -340,12 +399,17 @@ async def fetch_weather_market(event: dict) -> WeatherMarket | None:
     description = event.get("description", "")
     end_date = event.get("endDate", "")
 
+    # Skip non-temperature markets (precipitation, etc.)
+    title_lower = title.lower()
+    if any(kw in title_lower for kw in ["precipitation", "rainfall", "snowfall", "wind"]):
+        return None
+
     # Extract city name from title (heuristic)
     city = ""
     for word in title.split():
         if word[0].isupper() and len(word) > 2 and word.lower() not in {
             "what", "will", "the", "high", "low", "temperature", "daily", "max", "min",
-            "for", "on", "in", "be", "degrees",
+            "for", "on", "in", "be", "degrees", "highest",
         }:
             city = word
             break
@@ -370,20 +434,25 @@ async def fetch_weather_market(event: dict) -> WeatherMarket | None:
         outcome_prices = mkt.get("outcomePrices", "")
         if isinstance(outcome_prices, str):
             try:
-                outcome_prices = [float(p.strip()) for p in outcome_prices.strip("[]").split(",")]
+                prices_cleaned = outcome_prices.strip().strip("[]")
+                if prices_cleaned:
+                    outcome_prices = [float(p.strip()) for p in prices_cleaned.split(",") if p.strip()]
+                else:
+                    outcome_prices = []
             except ValueError:
                 outcome_prices = []
 
         tokens = mkt.get("clobTokenIds", "")
         if isinstance(tokens, str):
-            tokens = [t.strip() for t in tokens.strip("[]").split(",") if t.strip()]
+            tokens_cleaned = tokens.strip().strip("[]")
+            tokens = [t.strip().strip('"') for t in tokens_cleaned.split(",") if t.strip()]
 
         group_slug = mkt.get("groupItemTitle", "") or ""
 
         # If this is a single-outcome market within a group (each market = one bin)
         if group_slug:
             temp_val, is_range = _parse_temp_from_outcome(group_slug)
-            price = outcome_prices[0] * 100 if outcome_prices else 0.0
+            price = outcome_prices[0] * 100 if outcome_prices and outcome_prices[0] > 0 else 0.0
             token_id = tokens[0] if tokens else ""
             if token_id:
                 all_bins.append(TemperatureBin(
@@ -407,6 +476,17 @@ async def fetch_weather_market(event: dict) -> WeatherMarket | None:
                         price=round(price, 2),
                         is_range=is_range,
                     ))
+
+    # If all prices are 0, fetch real-time prices from CLOB API
+    if all_bins and all(b.price == 0.0 for b in all_bins):
+        logger.info("  Fetching real-time prices from CLOB API for %d bins...", len(all_bins))
+        import asyncio
+        async with httpx.AsyncClient() as client:
+            tasks = [_fetch_clob_price(client, b.token_id) for b in all_bins]
+            prices = await asyncio.gather(*tasks, return_exceptions=True)
+            for b, price in zip(all_bins, prices):
+                if isinstance(price, float):
+                    b.price = round(price, 2)
 
     if not all_bins:
         return None
