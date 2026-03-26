@@ -6,14 +6,14 @@ import argparse
 import asyncio
 import logging
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 
-from .config import CITIES, get_settings
+from .config import CITIES, Settings, get_settings
 from .bot import run_full_scan, scan_city
 from .consensus import find_consensus
 from .paper import PaperTrader
@@ -65,6 +65,13 @@ def parse_args() -> argparse.Namespace:
         help="Initial virtual balance in USD for paper trading (default: 200)",
     )
     scan_p.add_argument("-v", "--verbose", action="store_true")
+    scan_p.add_argument(
+        "--loop",
+        type=int,
+        default=None,
+        metavar="MINUTES",
+        help="Run continuously, scanning every N minutes (e.g. --loop 60)",
+    )
 
     # --- weather ---
     wx_p = sub.add_parser("weather", help="Check weather forecast for a city")
@@ -119,27 +126,15 @@ def _parse_date(date_str: str | None) -> date:
     return date.today() + timedelta(days=1)
 
 
-async def cmd_scan(args: argparse.Namespace) -> None:
-    settings = get_settings()
-    target = _parse_date(args.date)
-    is_live = args.live
-
-    if is_live:
-        console.print(Panel("[red bold]LIVE MODE[/red bold] — real orders will be placed!"))
-        console.print("[yellow]Press Ctrl+C within 5 seconds to cancel...[/yellow]")
-        await asyncio.sleep(5)
-        paper_trader = None
-        dry_run = False
-    else:
-        # Paper trading mode (default)
-        balance = args.balance or 200.0
-        paper_trader = PaperTrader(initial_balance_usd=balance)
-        console.print(Panel(
-            f"[green]PAPER TRADING MODE[/green] — virtual balance: "
-            f"[bold]${paper_trader.balance_usd:.2f}[/bold]\n"
-            f"Real market data, virtual orders. No real money at risk."
-        ))
-        dry_run = True
+async def _run_single_scan(
+    settings: Settings,
+    args: argparse.Namespace,
+    paper_trader: PaperTrader | None,
+    dry_run: bool,
+) -> None:
+    """Execute a single scan cycle."""
+    # Recalculate target date each cycle (tomorrow shifts at midnight)
+    target = _parse_date(args.date) if args.date else date.today() + timedelta(days=1)
 
     results = await run_full_scan(
         settings=settings,
@@ -150,7 +145,7 @@ async def cmd_scan(args: argparse.Namespace) -> None:
     )
 
     # Print summary table
-    table = Table(title="Trading Summary")
+    table = Table(title=f"Trading Summary — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     table.add_column("City", style="cyan")
     table.add_column("Markets", justify="right")
     table.add_column("Trades", justify="right", style="green")
@@ -168,10 +163,55 @@ async def cmd_scan(args: argparse.Namespace) -> None:
 
     console.print(table)
 
-    # Show paper trading portfolio summary
     if paper_trader is not None:
         console.print()
         console.print(paper_trader.summary())
+
+
+async def cmd_scan(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    is_live = args.live
+    loop_minutes = args.loop
+
+    if is_live:
+        console.print(Panel("[red bold]LIVE MODE[/red bold] — real orders will be placed!"))
+        console.print("[yellow]Press Ctrl+C within 5 seconds to cancel...[/yellow]")
+        await asyncio.sleep(5)
+        paper_trader = None
+        dry_run = False
+    else:
+        balance = args.balance or 200.0
+        paper_trader = PaperTrader(initial_balance_usd=balance)
+        mode_text = (
+            f"[green]PAPER TRADING MODE[/green] — virtual balance: "
+            f"[bold]${paper_trader.balance_usd:.2f}[/bold]\n"
+            f"Real market data, virtual orders. No real money at risk."
+        )
+        if loop_minutes:
+            mode_text += f"\n[cyan]Auto-scanning every {loop_minutes} minutes. Press Ctrl+C to stop.[/cyan]"
+        console.print(Panel(mode_text))
+        dry_run = True
+
+    if loop_minutes:
+        # Continuous mode — run scan on interval
+        cycle = 1
+        while True:
+            console.print(f"\n[bold cyan]--- Scan cycle #{cycle} ---[/bold cyan]")
+            try:
+                await _run_single_scan(settings, args, paper_trader, dry_run)
+            except Exception as e:
+                console.print(f"[red]Scan error: {e}[/red]")
+
+            cycle += 1
+            next_time = datetime.now() + timedelta(minutes=loop_minutes)
+            console.print(
+                f"\n[dim]Next scan at {next_time.strftime('%H:%M:%S')} "
+                f"(in {loop_minutes} min). Ctrl+C to stop.[/dim]"
+            )
+            await asyncio.sleep(loop_minutes * 60)
+    else:
+        # Single scan
+        await _run_single_scan(settings, args, paper_trader, dry_run)
 
 
 async def cmd_weather(args: argparse.Namespace) -> None:
