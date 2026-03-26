@@ -84,7 +84,7 @@ async def scan_city(
 
     # Step 3: Search for matching markets
     logger.info("Step 3: Searching Polymarket for %s weather markets...", city_name)
-    raw_events = await search_weather_markets(city_name)
+    raw_events = await search_weather_markets(city_name, target_date=target_date)
 
     if not raw_events:
         logger.info("  No weather markets found for %s", city_name)

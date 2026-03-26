@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import date
 
 import httpx
 
@@ -90,50 +91,212 @@ def _parse_temp_from_outcome(outcome: str) -> tuple[int | None, bool]:
     return None, False
 
 
-async def search_weather_markets(city: str | None = None) -> list[dict]:
+async def _resolve_tag_id(client: httpx.AsyncClient, slug: str) -> int | None:
+    """Resolve a tag slug (e.g. 'weather') to its numeric tag_id."""
+    try:
+        resp = await client.get(f"{GAMMA_API}/tags/slug/{slug}", timeout=TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        tag_id = data.get("id")
+        if tag_id:
+            logger.info("Resolved tag '%s' -> id=%s", slug, tag_id)
+            return int(tag_id)
+    except Exception:
+        logger.debug("Could not resolve tag slug '%s'", slug)
+    return None
+
+
+# City name mappings for Polymarket event slugs
+# Polymarket uses lowercase, hyphenated city names in slugs
+CITY_SLUG_MAP: dict[str, str] = {
+    "Tokyo": "tokyo",
+    "London": "london",
+    "Seoul": "seoul",
+    "Ankara": "ankara",
+    "New York": "nyc",
+    "Chicago": "chicago",
+    "Paris": "paris",
+    "Berlin": "berlin",
+    "Sydney": "sydney",
+    "Mumbai": "mumbai",
+    "Hong Kong": "hong-kong",
+    "Tel Aviv": "tel-aviv",
+}
+
+
+def _build_event_slug(city: str, target_date: date | None = None) -> str:
+    """Build the expected Polymarket event slug for a city/date.
+
+    Pattern: highest-temperature-in-{city}-on-{month}-{day}-{year}
+    """
+    from datetime import date as date_type, timedelta
+    if target_date is None:
+        target_date = date_type.today() + timedelta(days=1)
+
+    city_slug = CITY_SLUG_MAP.get(city, city.lower().replace(" ", "-"))
+    month = target_date.strftime("%B").lower()  # e.g. "march"
+    day = target_date.day
+    year = target_date.year
+    return f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
+
+
+async def search_weather_markets(
+    city: str | None = None,
+    target_date: date | None = None,
+) -> list[dict]:
     """Search Polymarket for active weather/temperature markets.
 
-    Uses the Gamma API to find events related to weather/temperature.
+    Strategy (in order of specificity):
+    1. Try direct slug lookup for the city/date
+    2. Search by tag_id (weather, temperature, daily-temperature)
+    3. Use text search API as fallback
+    4. Filter results by city name if specified
     """
+    from datetime import date as date_type, timedelta
+    if target_date is None:
+        target_date = date_type.today() + timedelta(days=1)
+
+    weather_events: list[dict] = []
+    seen_ids: set[str] = set()
+
     async with httpx.AsyncClient() as client:
-        # Search for temperature-related markets
-        params: dict = {
-            "active": "true",
-            "closed": "false",
-            "limit": 100,
-        }
+        # Strategy 1: Direct slug lookup for specific city + date
+        if city:
+            slug = _build_event_slug(city, target_date)
+            logger.info("Trying direct slug: %s", slug)
+            try:
+                resp = await client.get(
+                    f"{GAMMA_API}/events",
+                    params={"slug": slug},
+                    timeout=TIMEOUT,
+                )
+                resp.raise_for_status()
+                events = resp.json()
+                if isinstance(events, list):
+                    for e in events:
+                        eid = e.get("id", "")
+                        if eid and eid not in seen_ids:
+                            weather_events.append(e)
+                            seen_ids.add(eid)
+                elif isinstance(events, dict) and events.get("id"):
+                    weather_events.append(events)
+                    seen_ids.add(events["id"])
+            except Exception:
+                logger.debug("Slug lookup failed for %s", slug)
 
-        try:
-            resp = await client.get(
-                f"{GAMMA_API}/events",
-                params=params,
-                timeout=TIMEOUT,
-            )
-            resp.raise_for_status()
-            events = resp.json()
-        except Exception:
-            logger.exception("Failed to fetch events from Gamma API")
-            return []
+            # Also try yesterday/today slugs (markets might still be open)
+            for day_offset in [0, -1]:
+                alt_date = target_date + timedelta(days=day_offset)
+                if alt_date == target_date:
+                    continue
+                alt_slug = _build_event_slug(city, alt_date)
+                try:
+                    resp = await client.get(
+                        f"{GAMMA_API}/events",
+                        params={"slug": alt_slug, "active": "true", "closed": "false"},
+                        timeout=TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    events = resp.json()
+                    if isinstance(events, list):
+                        for e in events:
+                            eid = e.get("id", "")
+                            if eid and eid not in seen_ids:
+                                weather_events.append(e)
+                                seen_ids.add(eid)
+                except Exception:
+                    pass
 
-        # Filter for weather/temperature markets
-        weather_events = []
-        keywords = ["temperature", "weather", "°c", "°f", "degrees", "high temp"]
-        city_lower = city.lower() if city else None
+        # Strategy 2: Search by tag_id
+        tag_slugs = ["weather", "temperature", "daily-temperature", "climate-weather"]
+        for tag_slug in tag_slugs:
+            tag_id = await _resolve_tag_id(client, tag_slug)
+            if tag_id is None:
+                continue
 
-        for event in events:
+            offset = 0
+            while offset < 500:  # Safety limit
+                try:
+                    params: dict = {
+                        "tag_id": tag_id,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 100,
+                        "offset": offset,
+                    }
+                    resp = await client.get(
+                        f"{GAMMA_API}/events",
+                        params=params,
+                        timeout=TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    events = resp.json()
+                    if not events:
+                        break
+
+                    for e in events:
+                        eid = e.get("id", "")
+                        if eid and eid not in seen_ids:
+                            weather_events.append(e)
+                            seen_ids.add(eid)
+
+                    if len(events) < 100:
+                        break
+                    offset += 100
+                except Exception:
+                    logger.debug("Tag search failed for tag_id=%s offset=%d", tag_id, offset)
+                    break
+
+            if weather_events:
+                break  # Got results from this tag, no need to try others
+
+        # Strategy 3: Text search as fallback
+        if not weather_events:
+            search_query = f"temperature {city}" if city else "temperature"
+            try:
+                resp = await client.get(
+                    f"{GAMMA_API}/public-search",
+                    params={"query": search_query, "limit": 50},
+                    timeout=TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for e in data.get("events", []):
+                    eid = e.get("id", "")
+                    if eid and eid not in seen_ids:
+                        weather_events.append(e)
+                        seen_ids.add(eid)
+            except Exception:
+                logger.debug("Text search failed for '%s'", search_query)
+
+    # Filter by city name if specified
+    if city:
+        city_lower = city.lower()
+        # Also check common abbreviations
+        city_variants = {city_lower}
+        if city_lower == "new york":
+            city_variants.update(["nyc", "new york city", "new york"])
+        elif city_lower == "hong kong":
+            city_variants.add("hong kong")
+
+        filtered = []
+        for event in weather_events:
             title = event.get("title", "").lower()
-            desc = event.get("description", "").lower()
-            combined = title + " " + desc
+            slug = event.get("slug", "").lower()
+            combined = title + " " + slug
+            if any(v in combined for v in city_variants):
+                filtered.append(event)
 
-            is_weather = any(kw in combined for kw in keywords)
-            city_match = city_lower is None or city_lower in combined
+        # If filtering removed everything, check if slug lookup got results
+        if filtered:
+            weather_events = filtered
 
-            if is_weather and city_match:
-                weather_events.append(event)
-
-        logger.info("Found %d weather markets%s", len(weather_events),
-                     f" for {city}" if city else "")
-        return weather_events
+    logger.info(
+        "Found %d weather event(s)%s",
+        len(weather_events),
+        f" for {city}" if city else "",
+    )
+    return weather_events
 
 
 async def get_market_details(condition_id: str) -> dict | None:
