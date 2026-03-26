@@ -214,3 +214,47 @@ async def fetch_wttr_backup(city: str, target_date: date) -> float | None:
     except Exception:
         logger.exception("Failed to fetch wttr.in backup forecast")
     return None
+
+
+async def fetch_nws_backup(lat: float, lon: float, target_date: date) -> float | None:
+    """Fetch backup forecast from NWS API (US locations only, free, no key).
+
+    Returns max temperature in Celsius, or None if unavailable.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            # Step 1: Get the forecast office and grid coordinates
+            points_resp = await client.get(
+                f"https://api.weather.gov/points/{lat},{lon}",
+                headers={"User-Agent": "pogoda-bot/1.0"},
+                timeout=TIMEOUT,
+            )
+            points_resp.raise_for_status()
+            points_data = points_resp.json()
+            forecast_url = points_data["properties"]["forecast"]
+
+            # Step 2: Get the forecast
+            fc_resp = await client.get(
+                forecast_url,
+                headers={"User-Agent": "pogoda-bot/1.0"},
+                timeout=TIMEOUT,
+            )
+            fc_resp.raise_for_status()
+            fc_data = fc_resp.json()
+
+            for period in fc_data["properties"]["periods"]:
+                # NWS periods alternate day/night; daytime has isDaytime=True
+                if not period.get("isDaytime", False):
+                    continue
+                # Parse start time to check if it matches target date
+                start = period.get("startTime", "")
+                if str(target_date) in start:
+                    temp = period["temperature"]
+                    unit = period["temperatureUnit"]
+                    if unit == "F":
+                        from .utils import f_to_c
+                        return round(f_to_c(temp), 1)
+                    return round(float(temp), 1)
+    except Exception:
+        logger.exception("Failed to fetch NWS backup forecast")
+    return None

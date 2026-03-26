@@ -66,12 +66,15 @@ async def scan_city(
     if snapshot.today_actual_max is not None:
         logger.info("  Today's actual max: %.1f°C", snapshot.today_actual_max)
 
-    # Step 2: Find consensus
-    logger.info("Step 2: Finding consensus...")
-    consensus = await find_consensus(snapshot)
+    # Step 2: Find consensus (use city's temperature unit for bin matching)
+    temp_unit = city_info.get("unit", "C")
+    logger.info("Step 2: Finding consensus (unit=%s)...", temp_unit)
+    consensus = await find_consensus(snapshot, target_unit=temp_unit)
+    unit_label = "°F" if temp_unit == "F" else "°C"
     logger.info(
-        "  Consensus: %d°C (confidence=%s, method=%s)",
+        "  Consensus: %d%s (confidence=%s, method=%s)",
         consensus.consensus_temp_c,
+        unit_label,
         consensus.confidence,
         consensus.method,
     )

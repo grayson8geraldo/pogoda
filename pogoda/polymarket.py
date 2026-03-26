@@ -42,6 +42,8 @@ class WeatherMarket:
     bins: list[TemperatureBin] = field(default_factory=list)
     resolution_source: str = ""
     min_tick_size: float = 0.01
+    temp_unit: str = "C"  # "C" or "F" — detected from market title/bins
+    station_icao: str = ""  # Parsed from market rules (e.g. "KLGA")
 
     @property
     def sorted_bins(self) -> list[TemperatureBin]:
@@ -246,6 +248,12 @@ async def fetch_weather_market(event: dict) -> WeatherMarket | None:
     if not all_bins:
         return None
 
+    # Detect temperature unit from title/bins
+    temp_unit = _detect_temp_unit(title, [b.outcome for b in all_bins])
+
+    # Parse station ICAO code from description/resolution rules
+    station_icao = _parse_station_icao(description + " " + resolution_source)
+
     return WeatherMarket(
         condition_id=condition_id,
         question=title,
@@ -255,4 +263,56 @@ async def fetch_weather_market(event: dict) -> WeatherMarket | None:
         bins=all_bins,
         resolution_source=resolution_source,
         min_tick_size=min_tick,
+        temp_unit=temp_unit,
+        station_icao=station_icao,
     )
+
+
+def _detect_temp_unit(title: str, outcomes: list[str]) -> str:
+    """Detect whether market uses Celsius or Fahrenheit from title and outcome labels."""
+    combined = title.lower() + " " + " ".join(outcomes).lower()
+    if "°f" in combined or "fahrenheit" in combined:
+        return "F"
+    if "°c" in combined or "celsius" in combined:
+        return "C"
+    # Heuristic: if bin values > 50, likely Fahrenheit (most cities don't hit 50°C)
+    for outcome in outcomes:
+        match = re.match(r"(-?\d+)", outcome.strip())
+        if match and int(match.group(1)) > 50:
+            return "F"
+    return "C"
+
+
+def _parse_station_icao(text: str) -> str:
+    """Extract ICAO airport code from market rules text.
+
+    Looks for 4-letter codes like KLGA, EGLL, RJTT near words like
+    'airport', 'station', 'weather'.
+    """
+    # Pattern: 4 uppercase letters that look like ICAO codes (start with K for US, etc.)
+    icao_pattern = re.compile(r"\b([A-Z]{4})\b")
+    matches = icao_pattern.findall(text)
+
+    # Known ICAO prefixes for major regions
+    valid_prefixes = {
+        "K",    # US
+        "C",    # Canada
+        "EG",   # UK
+        "LF",   # France
+        "ED",   # Germany
+        "LT",   # Turkey
+        "RJ",   # Japan
+        "RK",   # South Korea
+        "ZS",   # China
+        "VA",   # India (west)
+        "VO",   # India (south)
+        "VE",   # India (east)
+        "YS",   # Australia (Sydney)
+        "YM",   # Australia (Melbourne)
+    }
+
+    for match in matches:
+        for prefix in valid_prefixes:
+            if match.startswith(prefix):
+                return match
+    return ""
