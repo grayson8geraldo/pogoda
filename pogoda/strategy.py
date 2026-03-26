@@ -162,11 +162,13 @@ def generate_orders(
     logger.info("Bin step detected: %d (unit=%s)", bin_step, market.temp_unit)
 
     # Check weather stability (compare in same temperature unit)
+    # This is a WARNING, not a hard rejection — unstable weather means higher risk
+    # but the strategy can still be profitable if the consensus is strong
     decision.weather_stable = check_weather_stability(
         snapshot, center, settings.stability_threshold_c, temp_unit=market.temp_unit
     )
     if not decision.weather_stable:
-        decision.rejection_reasons.append("Weather unstable (large day-to-day variation)")
+        logger.warning("Weather unstable — higher risk, but proceeding with analysis")
 
     # --- Collect bins ---
     # Core: consensus bin + adjacent bins (±1 step)
