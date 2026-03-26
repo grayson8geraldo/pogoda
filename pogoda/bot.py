@@ -8,6 +8,7 @@ from datetime import date, timedelta
 
 from .config import CITIES, Settings
 from .consensus import ConsensusResult, find_consensus
+from .ensemble import EnsembleAnalysis, fetch_ensemble_analysis
 from .polymarket import (
     WeatherMarket,
     fetch_weather_market,
@@ -103,8 +104,24 @@ async def scan_city(
             marker = " ← CONSENSUS" if b.temp_value == consensus.consensus_temp_c else ""
             logger.info("    %s: %.1f¢%s", b.outcome, b.price, marker)
 
+        # Step 4b: Fetch ensemble probabilities for better EV estimation
+        logger.info("Step 4b: Fetching ensemble probability estimates...")
+        sorted_bins = market.sorted_bins
+        if sorted_bins:
+            temp_lo = sorted_bins[0].temp_value or 0
+            temp_hi = sorted_bins[-1].temp_value or 100
+            bin_width = 2.0 if market.temp_unit == "F" else 1.0
+            ensemble = await fetch_ensemble_analysis(
+                lat, lon, target_date,
+                temp_range=(temp_lo, temp_hi),
+                target_unit=market.temp_unit,
+                bin_width=bin_width,
+            )
+        else:
+            ensemble = None
+
         # Step 5: Generate trade decision
-        decision = generate_orders(market, consensus, snapshot, settings)
+        decision = generate_orders(market, consensus, snapshot, settings, ensemble=ensemble)
         logger.info("\n%s", decision.summary())
 
         # Step 6: Execute (or dry-run)

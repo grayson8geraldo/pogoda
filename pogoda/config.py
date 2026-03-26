@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     polymarket_host: str = "https://clob.polymarket.com"
     private_key: str = ""
     chain_id: int = 137
+    # Signature type: 0=EOA (MetaMask), 1=Magic/email proxy, 2=Browser wallet
+    signature_type: int = 0
+    # Funder address (required for proxy wallets — the address that holds funds)
+    funder_address: str = ""
 
     # Trading parameters
     max_position_size_usd: float = 50.0

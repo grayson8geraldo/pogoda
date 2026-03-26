@@ -74,12 +74,19 @@ class Trader:
                 api_secret=self.settings.polymarket_api_secret,
                 api_passphrase=self.settings.polymarket_api_passphrase,
             )
-            self._client = ClobClient(
-                host=self.settings.polymarket_host,
-                key=self.settings.private_key,
-                chain_id=self.settings.chain_id,
-                creds=creds,
-            )
+
+            kwargs: dict = {
+                "host": self.settings.polymarket_host,
+                "key": self.settings.private_key,
+                "chain_id": self.settings.chain_id,
+                "creds": creds,
+                "signature_type": self.settings.signature_type,
+            }
+            # Funder address required for proxy wallets (Magic/Browser)
+            if self.settings.funder_address:
+                kwargs["funder"] = self.settings.funder_address
+
+            self._client = ClobClient(**kwargs)
             return self._client
         except ImportError:
             logger.error(
@@ -126,20 +133,20 @@ class Trader:
         try:
             client = self._get_client()
 
+            from py_clob_client.clob_types import OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
 
-            # Build and sign the order
-            signed_order = client.create_and_sign_order(
-                {
-                    "token_id": order.token_id,
-                    "price": order.price / 100.0,  # Convert cents to decimal
-                    "size": order.size,
-                    "side": BUY,
-                }
+            # Build and sign the limit order
+            order_args = OrderArgs(
+                token_id=order.token_id,
+                price=order.price / 100.0,  # Convert cents to decimal (0-1)
+                size=float(order.size),
+                side=BUY,
             )
+            signed_order = client.create_order(order_args)
 
-            # Post the order
-            resp = client.post_order(signed_order)
+            # Post as GTC (Good-Till-Cancelled) limit order
+            resp = client.post_order(signed_order, OrderType.GTC)
             order_id = resp.get("orderID", resp.get("id", "unknown"))
 
             logger.info(
