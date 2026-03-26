@@ -9,6 +9,7 @@ from datetime import date, timedelta
 from .config import CITIES, Settings
 from .consensus import ConsensusResult, find_consensus
 from .ensemble import EnsembleAnalysis, fetch_ensemble_analysis
+from .paper import PaperTrader
 from .polymarket import (
     WeatherMarket,
     fetch_weather_market,
@@ -26,6 +27,7 @@ async def scan_city(
     settings: Settings,
     target_date: date | None = None,
     dry_run: bool = True,
+    paper_trader: PaperTrader | None = None,
 ) -> list[tuple[TradeDecision, ExecutionReport | None]]:
     """Run the full pipeline for a single city.
 
@@ -124,12 +126,23 @@ async def scan_city(
         decision = generate_orders(market, consensus, snapshot, settings, ensemble=ensemble)
         logger.info("\n%s", decision.summary())
 
-        # Step 6: Execute (or dry-run)
+        # Step 6: Execute
         report = None
         if decision.checks_passed:
-            logger.info("Step 6: %s orders...", "Simulating" if dry_run else "Executing")
-            report = await trader.execute(decision, dry_run=dry_run)
-            logger.info("\n%s", report.summary())
+            if paper_trader is not None:
+                # Paper trading mode — simulate with virtual balance
+                logger.info("Step 6: Paper trading (virtual balance)...")
+                new_positions = paper_trader.execute_decision(decision)
+                if new_positions:
+                    logger.info(
+                        "  Opened %d virtual positions (balance: $%.2f)",
+                        len(new_positions),
+                        paper_trader.balance_usd,
+                    )
+            else:
+                logger.info("Step 6: %s orders...", "Simulating" if dry_run else "Executing")
+                report = await trader.execute(decision, dry_run=dry_run)
+                logger.info("\n%s", report.summary())
         else:
             logger.warning("Trade rejected: %s", ", ".join(decision.rejection_reasons))
 
@@ -143,6 +156,7 @@ async def run_full_scan(
     cities: list[str] | None = None,
     target_date: date | None = None,
     dry_run: bool = True,
+    paper_trader: PaperTrader | None = None,
 ) -> dict[str, list[tuple[TradeDecision, ExecutionReport | None]]]:
     """Scan multiple cities for trading opportunities.
 
@@ -162,7 +176,7 @@ async def run_full_scan(
 
     for city_key in cities:
         try:
-            results = await scan_city(city_key, settings, target_date, dry_run)
+            results = await scan_city(city_key, settings, target_date, dry_run, paper_trader)
             all_results[city_key] = results
         except Exception:
             logger.exception("Error scanning %s", city_key)

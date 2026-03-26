@@ -16,6 +16,7 @@ from rich.table import Table
 from .config import CITIES, get_settings
 from .bot import run_full_scan, scan_city
 from .consensus import find_consensus
+from .paper import PaperTrader
 from .weather import fetch_weather
 
 console = Console()
@@ -55,7 +56,13 @@ def parse_args() -> argparse.Namespace:
     scan_p.add_argument(
         "--live",
         action="store_true",
-        help="Execute real orders (default: dry-run)",
+        help="Execute real orders (default: paper trading)",
+    )
+    scan_p.add_argument(
+        "--balance",
+        type=float,
+        default=None,
+        help="Initial virtual balance in USD for paper trading (default: 200)",
     )
     scan_p.add_argument("-v", "--verbose", action="store_true")
 
@@ -80,6 +87,26 @@ def parse_args() -> argparse.Namespace:
     )
     mkt_p.add_argument("-v", "--verbose", action="store_true")
 
+    # --- portfolio ---
+    port_p = sub.add_parser("portfolio", help="Show paper trading portfolio")
+    port_p.add_argument("-v", "--verbose", action="store_true")
+
+    # --- resolve ---
+    res_p = sub.add_parser("resolve", help="Resolve a paper trading market")
+    res_p.add_argument("market", type=str, help="Market question string (partial match)")
+    res_p.add_argument("temp", type=int, help="Winning temperature value")
+    res_p.add_argument("-v", "--verbose", action="store_true")
+
+    # --- reset ---
+    reset_p = sub.add_parser("reset", help="Reset paper trading portfolio")
+    reset_p.add_argument(
+        "--balance",
+        type=float,
+        default=200.0,
+        help="New starting balance in USD (default: 200)",
+    )
+    reset_p.add_argument("-v", "--verbose", action="store_true")
+
     # --- cities ---
     sub.add_parser("cities", help="List supported cities")
 
@@ -95,20 +122,31 @@ def _parse_date(date_str: str | None) -> date:
 async def cmd_scan(args: argparse.Namespace) -> None:
     settings = get_settings()
     target = _parse_date(args.date)
-    dry_run = not args.live
+    is_live = args.live
 
-    if dry_run:
-        console.print(Panel("[yellow]DRY RUN MODE[/yellow] — no real orders will be placed"))
-    else:
+    if is_live:
         console.print(Panel("[red bold]LIVE MODE[/red bold] — real orders will be placed!"))
         console.print("[yellow]Press Ctrl+C within 5 seconds to cancel...[/yellow]")
         await asyncio.sleep(5)
+        paper_trader = None
+        dry_run = False
+    else:
+        # Paper trading mode (default)
+        balance = args.balance or 200.0
+        paper_trader = PaperTrader(initial_balance_usd=balance)
+        console.print(Panel(
+            f"[green]PAPER TRADING MODE[/green] — virtual balance: "
+            f"[bold]${paper_trader.balance_usd:.2f}[/bold]\n"
+            f"Real market data, virtual orders. No real money at risk."
+        ))
+        dry_run = True
 
     results = await run_full_scan(
         settings=settings,
         cities=args.cities,
         target_date=target,
         dry_run=dry_run,
+        paper_trader=paper_trader,
     )
 
     # Print summary table
@@ -130,13 +168,19 @@ async def cmd_scan(args: argparse.Namespace) -> None:
 
     console.print(table)
 
+    # Show paper trading portfolio summary
+    if paper_trader is not None:
+        console.print()
+        console.print(paper_trader.summary())
+
 
 async def cmd_weather(args: argparse.Namespace) -> None:
     city_info = CITIES[args.city]
     target = _parse_date(args.date)
+    temp_unit = city_info.get("unit", "C")
 
     console.print(f"\nFetching forecasts for [cyan]{city_info['name']}[/cyan] "
-                  f"(station: {city_info['station']})")
+                  f"(station: {city_info['station']}, ICAO: {city_info['icao']})")
     console.print(f"Target date: [yellow]{target}[/yellow]\n")
 
     snapshot = await fetch_weather(
@@ -158,12 +202,13 @@ async def cmd_weather(args: argparse.Namespace) -> None:
     console.print(table)
 
     # Consensus
-    consensus = await find_consensus(snapshot)
+    consensus = await find_consensus(snapshot, target_unit=temp_unit)
     style = {"high": "green", "medium": "yellow", "low": "red"}.get(
         consensus.confidence, "white"
     )
+    unit_label = "°F" if temp_unit == "F" else "°C"
     console.print(
-        f"\nConsensus: [{style}]{consensus.consensus_temp_c}°C[/{style}] "
+        f"\nConsensus: [{style}]{consensus.consensus_temp_c}{unit_label}[/{style}] "
         f"(confidence=[{style}]{consensus.confidence}[/{style}], "
         f"method={consensus.method}, spread={consensus.spread:.1f}°C)"
     )
@@ -187,7 +232,9 @@ async def cmd_markets(args: argparse.Namespace) -> None:
             continue
 
         console.print(f"\n[bold cyan]{market.question}[/bold cyan]")
-        console.print(f"  End: {market.end_date}")
+        console.print(f"  End: {market.end_date} | Unit: {market.temp_unit}")
+        if market.station_icao:
+            console.print(f"  Station: {market.station_icao}")
         if market.resolution_source:
             console.print(f"  Resolution: {market.resolution_source[:100]}")
 
@@ -205,11 +252,74 @@ async def cmd_markets(args: argparse.Namespace) -> None:
         console.print(table)
 
 
+def cmd_portfolio() -> None:
+    """Show paper trading portfolio status."""
+    paper = PaperTrader()
+    console.print(paper.summary())
+
+
+def cmd_resolve(args: argparse.Namespace) -> None:
+    """Resolve a paper trading market with the actual winning temperature."""
+    paper = PaperTrader()
+
+    # Find matching positions
+    query = args.market.lower()
+    matching_markets = set()
+    for pos in paper.positions:
+        if query in pos.market_question.lower():
+            matching_markets.add(pos.market_question)
+
+    if not matching_markets:
+        console.print(f"[yellow]No open positions matching '{args.market}'[/yellow]")
+        if paper.positions:
+            console.print("\nOpen positions in:")
+            for mq in set(p.market_question for p in paper.positions):
+                console.print(f"  - {mq}")
+        return
+
+    for market_q in matching_markets:
+        console.print(f"\nResolving: [cyan]{market_q}[/cyan]")
+        console.print(f"Winning temperature: [bold]{args.temp}[/bold]")
+
+        records = paper.resolve_market(market_q, args.temp)
+
+        if records:
+            table = Table(title="Resolution Results")
+            table.add_column("Outcome")
+            table.add_column("Result", justify="center")
+            table.add_column("P&L", justify="right")
+
+            for r in records:
+                result_style = "green bold" if r.resolved else "red"
+                result_text = "WON" if r.resolved else "LOST"
+                pnl_style = "green" if r.pnl_cents > 0 else "red"
+                table.add_row(
+                    r.outcome,
+                    f"[{result_style}]{result_text}[/{result_style}]",
+                    f"[{pnl_style}]{r.pnl_cents / 100:+.2f}$[/{pnl_style}]",
+                )
+            console.print(table)
+
+    console.print(f"\n[bold]Updated balance: ${paper.balance_usd:.2f}[/bold]")
+
+
+def cmd_reset(args: argparse.Namespace) -> None:
+    """Reset paper trading portfolio."""
+    paper = PaperTrader()
+    old_balance = paper.balance_usd
+    paper.reset(args.balance)
+    console.print(
+        f"Portfolio reset: ${old_balance:.2f} -> [bold green]${args.balance:.2f}[/bold green]"
+    )
+
+
 def cmd_cities() -> None:
     table = Table(title="Supported Cities")
     table.add_column("Key", style="cyan")
     table.add_column("City", style="bold")
     table.add_column("Station")
+    table.add_column("ICAO", style="yellow")
+    table.add_column("Unit")
     table.add_column("Lat", justify="right")
     table.add_column("Lon", justify="right")
 
@@ -218,6 +328,8 @@ def cmd_cities() -> None:
             key,
             info["name"],
             info["station"],
+            info["icao"],
+            info["unit"],
             f"{info['lat']:.4f}",
             f"{info['lon']:.4f}",
         )
@@ -232,18 +344,33 @@ def main() -> None:
         console.print("[bold]Pogoda[/bold] — Weather trading bot for Polymarket\n")
         console.print("Usage: pogoda <command> [options]\n")
         console.print("Commands:")
-        console.print("  [cyan]scan[/cyan]     Scan for trading opportunities")
-        console.print("  [cyan]weather[/cyan]  Check weather forecast for a city")
-        console.print("  [cyan]markets[/cyan]  List active weather markets")
-        console.print("  [cyan]cities[/cyan]   List supported cities")
+        console.print("  [cyan]scan[/cyan]        Scan & trade (paper trading by default)")
+        console.print("  [cyan]weather[/cyan]     Check weather forecast for a city")
+        console.print("  [cyan]markets[/cyan]     List active weather markets")
+        console.print("  [cyan]portfolio[/cyan]   Show paper trading portfolio & P&L")
+        console.print("  [cyan]resolve[/cyan]     Resolve a market (mark actual winner)")
+        console.print("  [cyan]reset[/cyan]       Reset paper trading portfolio")
+        console.print("  [cyan]cities[/cyan]      List supported cities")
         console.print("\nRun [cyan]pogoda <command> --help[/cyan] for details.")
+        console.print("\n[dim]Paper trading is the default mode — no API keys needed.[/dim]")
+        console.print("[dim]Use --live for real orders (requires Polymarket API keys).[/dim]")
         sys.exit(0)
 
+    # Sync commands
     if args.command == "cities":
         cmd_cities()
         return
+    if args.command == "portfolio":
+        cmd_portfolio()
+        return
+    if args.command == "resolve":
+        cmd_resolve(args)
+        return
+    if args.command == "reset":
+        cmd_reset(args)
+        return
 
-    # Run async commands
+    # Async commands
     coro = {
         "scan": cmd_scan,
         "weather": cmd_weather,
