@@ -70,7 +70,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         metavar="MINUTES",
-        help="Run continuously, scanning every N minutes (e.g. --loop 60)",
+        help="Scan interval in minutes (default: 60)",
+    )
+    scan_p.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single scan and exit (no continuous loop)",
     )
 
     # --- weather ---
@@ -172,6 +177,7 @@ async def cmd_scan(args: argparse.Namespace) -> None:
     settings = get_settings()
     is_live = args.live
     loop_minutes = args.loop
+    run_once = args.once
 
     if is_live:
         console.print(Panel("[red bold]LIVE MODE[/red bold] — real orders will be placed!"))
@@ -182,36 +188,41 @@ async def cmd_scan(args: argparse.Namespace) -> None:
     else:
         balance = args.balance or 200.0
         paper_trader = PaperTrader(initial_balance_usd=balance)
+        interval = loop_minutes or 60
         mode_text = (
             f"[green]PAPER TRADING MODE[/green] — virtual balance: "
             f"[bold]${paper_trader.balance_usd:.2f}[/bold]\n"
             f"Real market data, virtual orders. No real money at risk."
         )
-        if loop_minutes:
-            mode_text += f"\n[cyan]Auto-scanning every {loop_minutes} minutes. Press Ctrl+C to stop.[/cyan]"
+        if not run_once:
+            mode_text += f"\n[cyan]Auto-scanning every {interval} min. Press Ctrl+C to stop.[/cyan]"
         console.print(Panel(mode_text))
         dry_run = True
 
-    if loop_minutes:
-        # Continuous mode — run scan on interval
-        cycle = 1
-        while True:
-            console.print(f"\n[bold cyan]--- Scan cycle #{cycle} ---[/bold cyan]")
-            try:
-                await _run_single_scan(settings, args, paper_trader, dry_run)
-            except Exception as e:
-                console.print(f"[red]Scan error: {e}[/red]")
-
-            cycle += 1
-            next_time = datetime.now() + timedelta(minutes=loop_minutes)
-            console.print(
-                f"\n[dim]Next scan at {next_time.strftime('%H:%M:%S')} "
-                f"(in {loop_minutes} min). Ctrl+C to stop.[/dim]"
-            )
-            await asyncio.sleep(loop_minutes * 60)
-    else:
-        # Single scan
+    # Single scan mode
+    if run_once:
         await _run_single_scan(settings, args, paper_trader, dry_run)
+        return
+
+    # Continuous mode (default) — scan every N minutes
+    if loop_minutes is None:
+        loop_minutes = 60
+
+    cycle = 1
+    while True:
+        console.print(f"\n[bold cyan]--- Scan cycle #{cycle} ---[/bold cyan]")
+        try:
+            await _run_single_scan(settings, args, paper_trader, dry_run)
+        except Exception as e:
+            console.print(f"[red]Scan error: {e}[/red]")
+
+        cycle += 1
+        next_time = datetime.now() + timedelta(minutes=loop_minutes)
+        console.print(
+            f"\n[dim]Next scan at {next_time.strftime('%H:%M:%S')} "
+            f"(in {loop_minutes} min). Ctrl+C to stop.[/dim]"
+        )
+        await asyncio.sleep(loop_minutes * 60)
 
 
 async def cmd_weather(args: argparse.Namespace) -> None:
