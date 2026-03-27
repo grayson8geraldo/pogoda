@@ -149,14 +149,27 @@ class PaperTrader:
 
     # --- Trading ---
 
+    def has_position_for_market(self, market_question: str) -> bool:
+        """Check if we already have open positions for this market."""
+        return any(p.market_question == market_question for p in self.positions)
+
     def execute_decision(self, decision: TradeDecision) -> list[VirtualPosition]:
         """Simulate executing all orders in a trade decision.
 
         Orders "fill" instantly at the limit price (best-case simulation).
+        Skips if we already have positions for this market (prevents duplicates).
         Returns list of new positions opened.
         """
         if not decision.checks_passed:
             logger.warning("[PAPER] Decision did not pass checks — skipping")
+            return []
+
+        # Prevent duplicate positions on the same market
+        if self.has_position_for_market(decision.market.question):
+            logger.info(
+                "[PAPER] Already have positions for '%s' — skipping",
+                decision.market.question,
+            )
             return []
 
         new_positions = []
@@ -318,6 +331,119 @@ class PaperTrader:
                 lines.append(f"      Market: {p.market_question}")
 
         return "\n".join(lines)
+
+    def get_open_market_dates(self) -> dict[str, str]:
+        """Get unique market questions and their dates from open positions.
+
+        Returns dict of {market_question: date_str} for markets that may need resolution.
+        """
+        import re
+        markets: dict[str, str] = {}
+        months = {
+            "january": "01", "february": "02", "march": "03", "april": "04",
+            "may": "05", "june": "06", "july": "07", "august": "08",
+            "september": "09", "october": "10", "november": "11", "december": "12",
+        }
+        for p in self.positions:
+            if p.market_question in markets:
+                continue
+            m = re.search(r"on\s+(\w+)\s+(\d{1,2})", p.market_question, re.I)
+            if m:
+                month_name = m.group(1).lower()
+                day = m.group(2).zfill(2)
+                month = months.get(month_name, "")
+                if month:
+                    year = datetime.now().year
+                    markets[p.market_question] = f"{year}-{month}-{day}"
+        return markets
+
+    async def auto_resolve_expired(
+        self,
+        city_coords: dict[str, tuple[float, float]],
+    ) -> list[TradeRecord]:
+        """Automatically resolve markets whose date has passed.
+
+        Fetches actual observed temperature from Open-Meteo historical API
+        and resolves positions accordingly.
+
+        Args:
+            city_coords: Mapping of city name → (lat, lon) for fetching actuals.
+        """
+        import re
+        from datetime import date
+
+        import httpx
+
+        today = date.today()
+        market_dates = self.get_open_market_dates()
+        all_records: list[TradeRecord] = []
+
+        for market_q, date_str in market_dates.items():
+            market_date = date.fromisoformat(date_str)
+            if market_date >= today:
+                continue  # Market hasn't expired yet
+
+            # Find city from market question
+            city_name = None
+            for city in city_coords:
+                if city.lower() in market_q.lower():
+                    city_name = city
+                    break
+            # Also check abbreviations
+            if city_name is None and "nyc" in market_q.lower():
+                city_name = "New York"
+
+            if city_name is None or city_name not in city_coords:
+                logger.warning("[PAPER] Cannot find city for '%s' — skip auto-resolve", market_q)
+                continue
+
+            lat, lon = city_coords[city_name]
+
+            # Fetch actual observed max temperature
+            try:
+                async with httpx.AsyncClient() as client:
+                    # Determine unit from market question
+                    is_fahrenheit = "°f" in market_q.lower() or "f " in market_q.lower()
+
+                    params = {
+                        "latitude": lat,
+                        "longitude": lon,
+                        "daily": "temperature_2m_max",
+                        "timezone": "auto",
+                        "start_date": date_str,
+                        "end_date": date_str,
+                    }
+                    if is_fahrenheit:
+                        params["temperature_unit"] = "fahrenheit"
+
+                    resp = await client.get(
+                        "https://api.open-meteo.com/v1/forecast",
+                        params=params,
+                        timeout=15.0,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    max_temps = data.get("daily", {}).get("temperature_2m_max", [])
+
+                    if not max_temps:
+                        logger.warning("[PAPER] No actual temp data for %s on %s", city_name, date_str)
+                        continue
+
+                    actual_temp = round(max_temps[0])
+                    logger.info(
+                        "[PAPER] Actual temp for %s on %s: %d%s",
+                        city_name, date_str, actual_temp,
+                        "°F" if is_fahrenheit else "°C",
+                    )
+
+                    # Resolve the market
+                    records = self.resolve_market(market_q, actual_temp)
+                    all_records.extend(records)
+
+            except Exception:
+                logger.exception("[PAPER] Failed to fetch actual temp for %s", market_q)
+
+        return all_records
 
     def reset(self, initial_balance_usd: float = 200.0) -> None:
         """Reset portfolio to initial state."""

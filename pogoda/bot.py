@@ -199,6 +199,25 @@ async def run_full_scan(
 
     all_results: dict[str, list[tuple[TradeDecision, ExecutionReport | None]]] = {}
 
+    # Auto-resolve expired markets before scanning for new ones
+    if paper_trader and paper_trader.positions:
+        logger.info("Checking for expired markets to auto-resolve...")
+        city_coords = {
+            info["name"]: (info["lat"], info["lon"])
+            for info in CITIES.values()
+        }
+        # Add NYC alias
+        city_coords["NYC"] = city_coords.get("New York", (40.7772, -73.8726))
+        resolved = await paper_trader.auto_resolve_expired(city_coords)
+        if resolved:
+            wins = sum(1 for r in resolved if r.resolved)
+            losses = sum(1 for r in resolved if not r.resolved)
+            total_pnl = sum(r.pnl_cents for r in resolved) / 100
+            logger.info(
+                "Auto-resolved %d positions: %d wins, %d losses, P&L: $%.2f",
+                len(resolved), wins, losses, total_pnl,
+            )
+
     for city_key in cities:
         try:
             results = await scan_city(city_key, settings, target_date, dry_run, paper_trader)
